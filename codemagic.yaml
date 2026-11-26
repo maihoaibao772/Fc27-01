@@ -153,15 +153,24 @@ workflows:
               return 0
             fi
 
-            # 3) ZIP / 7Z / .001
+            # 3) ZIP / 7Z / .001 (tự nhận diện RAR5 đổi đuôi thành .zip để giải nén bằng unar, và fallback sang unar nếu 7zz lỗi)
             local ARCH
             ARCH=$(find "$src_dir" -maxdepth 1 -type f \( -iname "*.zip" -o -iname "*.7z" -o -iname "*.001" \) | head -n 1 || true)
             if [ -n "$ARCH" ]; then
+              local MAGIC
+              MAGIC=$(LC_ALL=C head -c 4 "$ARCH" 2>/dev/null || true)
+              if [ "$MAGIC" = "Rar!" ]; then
+                echo "Detected RAR archive disguised as $(basename "$ARCH") -> extracting with unar..."
+                unar -force-overwrite ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} -output-directory "$dst_dir" "$ARCH"
+                return 0
+              fi
               echo "Extracting archive: $(basename "$ARCH")"
               if [ -n "${ARCHIVE_PASS:-}" ]; then
-                7zz x -y "-p${ARCHIVE_PASS}" "-o${dst_dir}" "$ARCH"
+                7zz x -y "-p${ARCHIVE_PASS}" "-o${dst_dir}" "$ARCH" || \
+                  unar -force-overwrite ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} -output-directory "$dst_dir" "$ARCH"
               else
-                7zz x -y "-o${dst_dir}" "$ARCH"
+                7zz x -y "-o${dst_dir}" "$ARCH" || \
+                  unar -force-overwrite -output-directory "$dst_dir" "$ARCH"
               fi
               return 0
             fi
