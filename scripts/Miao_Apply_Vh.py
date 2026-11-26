@@ -349,9 +349,71 @@ def apply_vh(extract_dir: Path, vh_dir: Path, engine_dir: Path) -> None:
                 raise RuntimeError(f"Không tìm thấy RomFS.img hoặc thư mục RomFS trong {extract_dir}!")
 
 
+def _find_rewrite_stmt_lineno(src: str) -> int:
+    """
+    Dùng AST để tìm đúng dòng bắt đầu của câu lệnh thực thi patch_nso.py bên trong hàm
+    (bỏ qua hoàn toàn docstring và comment ở đầu file, tránh chèn vào giữa lời gọi nhiều dòng).
+    """
+    import ast
+
+    tree = ast.parse(src)
+    lines = src.splitlines()
+
+    def stmt_has_patch_nso(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                if "patch_nso.py" in sub.value:
+                    return True
+        return False
+
+    def search_body(stmts):
+        for st in stmts:
+            # Bỏ qua docstring
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str):
+                continue
+            # Đi sâu vào các khối con (if/for/with/try) để chèn sát câu lệnh thực thi nhất
+            for attr in ("body", "orelse", "finalbody"):
+                child_list = getattr(st, attr, None)
+                if isinstance(child_list, list):
+                    hit = search_body(child_list)
+                    if hit is not None:
+                        return hit
+            if isinstance(st, ast.Try):
+                for h in st.handlers:
+                    hit = search_body(h.body)
+                    if hit is not None:
+                        return hit
+            if stmt_has_patch_nso(st):
+                return st.lineno
+        return None
+
+    # Ưu tiên tìm bên trong các hàm (def ...)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            hit = search_body(node.body)
+            if hit is not None:
+                return hit
+
+    # Fallback: tìm câu lệnh top-level không phải docstring
+    hit = search_body(tree.body)
+    if hit is not None:
+        return hit
+
+    # Fallback cuối: tìm dòng code không phải comment có chuỗi "patch_nso.py"
+    for idx, ln in enumerate(lines, 1):
+        s = ln.lstrip()
+        if s.startswith("#"):
+            continue
+        if '"patch_nso.py"' in ln or "'patch_nso.py'" in ln:
+            return idx
+
+    raise RuntimeError("Không tìm thấy câu lệnh gọi patch_nso.py trong build_ipa_from_nsp.py để chèn hook VH!")
+
+
 def hook_builder(builder_path: Path, vh_dir: Path, script_path: Path, engine_dir: Path) -> None:
     """
     Tiêm hook gọi miao_apply_vh.py vào build_ipa_from_nsp.py ngay trước bước rewrite (patch_nso.py).
+    Tự import cục bộ (_mos, _mglob, _msub, _msys) và tự dò thư mục extract/v* từ sys.argv[1] hoặc biến cục bộ.
     """
     src = builder_path.read_text(encoding="utf-8")
     marker = "# MIAO_VH_HOOK_INJECTED"
@@ -359,24 +421,41 @@ def hook_builder(builder_path: Path, vh_dir: Path, script_path: Path, engine_dir
         print("[VH] Hook đã có sẵn trong build_ipa_from_nsp.py.")
         return
 
-    m = re.search(r"^([ \t]*).*patch_nso\.py", src, flags=re.MULTILINE)
-    if not m:
-        raise RuntimeError("Không tìm thấy vị trí gọi patch_nso.py trong build_ipa_from_nsp.py để chèn hook VH!")
+    lineno = _find_rewrite_stmt_lineno(src)
+    lines = src.splitlines(keepends=True)
+    target_line = lines[lineno - 1]
+    indent = re.match(r"[ \t]*", target_line).group(0)
 
-    indent = m.group(1)
-    hook_code = (
-        f"{indent}{marker}\n"
-        f"{indent}if os.environ.get('MIAO_VH_APPLIED') != '1':\n"
-        f"{indent}    import glob as _mglob\n"
-        f"{indent}    _cands = sorted(_mglob.glob(os.path.join(str(work), 'extract', 'v*')))\n"
-        f"{indent}    if _cands:\n"
-        f"{indent}        subprocess.run([sys.executable, {str(script_path)!r}, "
-        f"'--extract-dir', _cands[-1], '--vh-dir', {str(vh_dir)!r}, '--engine-dir', {str(engine_dir)!r}], check=True)\n"
-        f"{indent}        os.environ['MIAO_VH_APPLIED'] = '1'\n"
-    )
-    patched = src[: m.start()] + hook_code + src[m.start() :]
+    hook_lines = [
+        f"{indent}{marker}\n",
+        f"{indent}import os as _mos, glob as _mglob, subprocess as _msub, sys as _msys\n",
+        f"{indent}if _mos.environ.get('MIAO_VH_APPLIED') != '1':\n",
+        f"{indent}    _m_cands = []\n",
+        f"{indent}    for _m_v in ('extract_dir', 'work', 'work_dir', 'build_dir'):\n",
+        f"{indent}        _m_p = locals().get(_m_v)\n",
+        f"{indent}        if _m_p:\n",
+        f"{indent}            _m_s = str(_m_p)\n",
+        f"{indent}            if _mos.path.isdir(_mos.path.join(_m_s, 'ExeFS')) or _mos.path.isdir(_mos.path.join(_m_s, 'exefs')):\n",
+        f"{indent}                _m_cands.append(_m_s)\n",
+        f"{indent}            _m_cands.extend(_mglob.glob(_mos.path.join(_m_s, 'extract', 'v*')))\n",
+        f"{indent}            _m_cands.extend(_mglob.glob(_mos.path.join(_m_s, 'v*')))\n",
+        f"{indent}    if not _m_cands and len(_msys.argv) > 1:\n",
+        f"{indent}        _m_root = _mos.path.abspath(_msys.argv[1])\n",
+        f"{indent}        _m_cands.extend(_mglob.glob(_mos.path.join(_m_root, '*_build', 'extract', 'v*')))\n",
+        f"{indent}        _m_cands.extend(_mglob.glob(_mos.path.join(_m_root, '*', 'extract', 'v*')))\n",
+        f"{indent}        _m_cands.extend(_mglob.glob(_mos.path.join(_m_root, 'extract', 'v*')))\n",
+        f"{indent}    _m_cands = sorted(set(_mp for _mp in _m_cands if _mos.path.isdir(_mp)))\n",
+        f"{indent}    if not _m_cands:\n",
+        f"{indent}        raise RuntimeError('[VH] Không tìm thấy thư mục extract/v* để áp Việt hóa!')\n",
+        f"{indent}    _msub.run([_msys.executable, {str(script_path)!r}, '--extract-dir', _m_cands[-1], '--vh-dir', {str(vh_dir)!r}, '--engine-dir', {str(engine_dir)!r}], check=True)\n",
+        f"{indent}    _mos.environ['MIAO_VH_APPLIED'] = '1'\n",
+    ]
+
+    patched = "".join(lines[: lineno - 1] + hook_lines + lines[lineno - 1 :])
+    # Xác minh cú pháp Python ngay lập tức trước khi ghi
+    compile(patched, str(builder_path), "exec")
     builder_path.write_text(patched, encoding="utf-8")
-    print(f"[VH] Đã chèn hook Việt hóa vào {builder_path} ngay trước bước rewrite.")
+    print(f"[VH] Đã chèn hook Việt hóa vào {builder_path} tại dòng {lineno} (ngay trước bước rewrite).")
 
 
 def main():
