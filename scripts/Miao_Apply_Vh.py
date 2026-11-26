@@ -107,7 +107,7 @@ def apply_ips32_to_nso(nso_path: Path, ips_path: Path) -> None:
                 import lz4.block
             except ImportError as exc:
                 raise RuntimeError("Thiếu thư viện Python 'lz4' để giải nén NSO0!") from exc
-            data = bytearray(lz4.block.decompress(blob, uncompressed_size=decomp_size))
+            data = bytearray(lz4.block.decompress(blob, uncompressed_size=decomp_size, store_size=False))
         else:
             data = bytearray(blob)
         if len(data) != decomp_size:
@@ -245,15 +245,28 @@ def patch_romfs_img(romfs_img: Path, vh_romfs_dir: Path, engine_dir: Path) -> No
         print(f"[VH] Đã ghép RomFS: ghi đè {replaced} file, thêm mới {added} file.")
 
         new_img = romfs_img.with_suffix(".img.vh_tmp")
-        pack_cmd = [sys.executable, str(romfs_tool), str(tmp_root), str(new_img)]
-        r = subprocess.run(pack_cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            pack_cmd2 = [sys.executable, str(romfs_tool), str(tmp_root), "-o", str(new_img)]
-            r2 = subprocess.run(pack_cmd2, capture_output=True, text=True)
-            if r2.returncode != 0:
-                raise RuntimeError(
-                    f"Lỗi đóng gói lại RomFS.img:\n{r.stderr}\n{r2.stderr}"
-                )
+        packed_ok = False
+        try:
+            tools_dir = str(engine_dir / "dm/tools")
+            if tools_dir not in sys.path:
+                sys.path.insert(0, tools_dir)
+            import romfs_image as _ri
+            if callable(getattr(_ri, "pack", None)):
+                _ri.pack(tmp_root, new_img, reuse=False)
+                packed_ok = new_img.is_file() and new_img.stat().st_size > 0
+        except Exception as exc:
+            print(f"[VH] Fallback CLI cho romfs_image.pack ({exc})")
+
+        if not packed_ok:
+            pack_cmd = [sys.executable, str(romfs_tool), str(tmp_root), str(new_img)]
+            r = subprocess.run(pack_cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                pack_cmd2 = [sys.executable, str(romfs_tool), str(tmp_root), "-o", str(new_img)]
+                r2 = subprocess.run(pack_cmd2, capture_output=True, text=True)
+                if r2.returncode != 0:
+                    raise RuntimeError(
+                        f"Lỗi đóng gói lại RomFS.img:\n{r.stderr}\n{r2.stderr}"
+                    )
 
         new_img.replace(romfs_img)
         print(f"[VH] Đã đóng gói lại {romfs_img} thành công ({romfs_img.stat().st_size / (1024**3):.2f} GiB).")
@@ -275,7 +288,42 @@ def _find_case_insensitive(root: Path, rel: Path):
 
 
 def _unpack_dmromfs(img_path: Path, out_dir: Path, romfs_tool: Path):
-    """Đọc cấu trúc DMROMFS1 từ romfs_image.py để bung toàn bộ file ra out_dir."""
+    """Bung toàn bộ file từ DMROMFS1 (RomFS.img) ra out_dir bằng dm/tools/romfs.py hoặc romfs_image.py."""
+    tools_dir = romfs_tool.parent
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+
+    # 1) Ưu tiên dùng dm/tools/romfs.py (rfs.Path) — reader chính thức của nxnative
+    try:
+        import romfs as _rfs
+        root_p = _rfs.Path(img_path)
+        count = 0
+        for entry in root_p.rglob("*"):
+            if not entry.is_file():
+                continue
+            try:
+                rel = str(entry.relative_to(root_p)).lstrip("/")
+            except Exception:
+                s_root = str(root_p).rstrip("/")
+                s_ent = str(entry)
+                rel = s_ent[len(s_root):].lstrip("/") if s_ent.startswith(s_root) else s_ent.lstrip("/")
+            if not rel:
+                continue
+            dst = out_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if hasattr(entry, "open"):
+                with entry.open("rb") as fsrc, open(dst, "wb") as fdst:
+                    shutil.copyfileobj(fsrc, fdst, length=4 * 1024 * 1024)
+            else:
+                dst.write_bytes(entry.read_bytes())
+            count += 1
+        if count > 0:
+            print(f"[VH] Đã bung {count} file từ RomFS.img qua dm/tools/romfs.py.")
+            return
+    except Exception as exc:
+        print(f"[VH] Thử bung qua dm/tools/romfs.py chưa được ({exc}), chuyển sang romfs_image.py...")
+
+    # 2) Fallback sang romfs_image.py
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("nx_romfs_image", str(romfs_tool))
@@ -302,8 +350,8 @@ def _unpack_dmromfs(img_path: Path, out_dir: Path, romfs_tool: Path):
     with open(img_path, "rb") as f:
         magic = f.read(8)
         raise RuntimeError(
-            f"romfs_image.py không có sẵn hàm extract (magic={magic!r}). "
-            "Vui lòng kiểm tra phiên bản dm/tools/romfs_image.py trong engine."
+            f"romfs_image.py / romfs.py không bung được RomFS.img (magic={magic!r}). "
+            "Vui lòng kiểm tra phiên bản dm/tools/ trong engine."
         )
 
 
