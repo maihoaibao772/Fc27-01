@@ -1,0 +1,432 @@
+workflows:
+  build-fc27-ios:
+    name: EA SPORTS FC 27 iOS (1.8d.310c VH + Squad + Glass UI + <15 Pro Support)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      groups:
+        - fc27_secrets
+      vars:
+        # Ngôn ngữ mặc định trong game ("en" để khớp gói Việt hóa 1.8d.310c)
+        GAME_LANG: "en"
+      xcode: 27.0
+    scripts:
+      - name: 1. Free Disk Space (Target > 190 GB)
+        script: |
+          set -euo pipefail
+          df -h /
+          rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
+          xcrun simctl runtime delete all || true
+          rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
+          brew cleanup --prune=all || true
+          df -h /
+
+      - name: 2. Install & Verify All Build Tools (Fail-Fast)
+        script: |
+          set -euo pipefail
+          # 2A. Metal Toolchain (kèm cơ chế tự mount DMG cho Xcode 26/27)
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Downloading Xcode MetalToolchain..."
+            xcodebuild -downloadComponent MetalToolchain || true
+            sleep 3
+          fi
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "MetalToolchain not auto-mounted; installing Metal.xctoolchain from DMG..."
+            DMG=$(find /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain -name "*.dmg" 2>/dev/null | head -n 1 || true)
+            if [ -n "$DMG" ]; then
+              mkdir -p /tmp/metal_mnt
+              hdiutil attach -nobrowse -readonly "$DMG" -mountpoint /tmp/metal_mnt
+              TC=$(find /tmp/metal_mnt -maxdepth 3 -name "Metal.xctoolchain" -type d | head -n 1 || true)
+              if [ -n "$TC" ]; then
+                sudo mkdir -p /Library/Developer/Toolchains
+                sudo rm -rf /Library/Developer/Toolchains/Metal.xctoolchain
+                sudo cp -R "$TC" /Library/Developer/Toolchains/Metal.xctoolchain
+              fi
+              hdiutil detach /tmp/metal_mnt || true
+            fi
+            sudo xcodebuild -runFirstLaunch || true
+          fi
+          xcrun -sdk macosx metal --version
+          xcrun -sdk iphoneos metal --version
+
+          # 2B. CLI tools (kèm unar + sevenzip để tự giải nén .part*.rar / .7z / .zip)
+          brew install xcodegen zstd spirv-cross glslang unar sevenzip || true
+          for tool in xcodegen zstd spirv-cross glslangValidator unar 7zz; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: Missing required tool: $tool"; exit 1; }
+          done
+
+          # 2C. Dual-arch .NET 10 (arm64 + x64)
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          chmod +x /tmp/dotnet-install.sh
+          /tmp/dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet"
+          /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+
+          # 2D. Python virtual environment
+          python3 -m venv "$CM_BUILD_DIR/.venv"
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          pip install --no-cache-dir --upgrade pip
+          pip install --no-cache-dir \
+            uv lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow \
+            requests gdown "backports.zstd; python_version < '3.14'"
+
+      - name: 3. Sync LNPANDY/NX2Apple Engine (<15 Pro Support) & Download Files
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          # Dùng LNPANDY/NX2Apple để có sẵn bc-cpu-decode + quản lý áp lực RAM iOS cho máy dưới 15 Pro
+          git clone --depth 1 https://github.com/LNPANDY/NX2Apple.git "$CM_BUILD_DIR/nx2apple"
+          (cd "$CM_BUILD_DIR/nx2apple" && python3 tools/engine.py sync)
+          ENGINE_DIR="$CM_BUILD_DIR/nx2apple/engine"
+
+          git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git "$CM_BUILD_DIR/gf_dl"
+          find "$ENGINE_DIR" \( -name "*.sh" -o -name "dmsh_xlate" -o -name "spirv-cross" -o -name "nx_extract" \) -exec chmod +x {} + || true
+
+          if [ ! -f "$ENGINE_DIR/dm/gfx/tools/frostbite.py" ] || [ ! -d "$ENGINE_DIR/dm/games/0100C49025D3E000" ]; then
+            echo "ERROR: Engine missing frostbite.py or 0100C49025D3E000 profile!"
+            exit 1
+          fi
+
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_DIR="$CM_BUILD_DIR/keys"
+          VH_DL_DIR="$CM_BUILD_DIR/vh_dl"
+          VH_DIR="$CM_BUILD_DIR/vh_extracted"
+          SQUAD_DL_DIR="$CM_BUILD_DIR/squad_dl"
+          SQUAD_DIR="$CM_BUILD_DIR/squad_extracted"
+          BG_DIR="$CM_BUILD_DIR/bg_dl"
+          mkdir -p "$GAME_DIR" "$KEYS_DIR" "$VH_DL_DIR" "$VH_DIR" "$SQUAD_DL_DIR" "$SQUAD_DIR" "$BG_DIR"
+
+          download_one_url() {
+            local url="$1"
+            local out_dir="$2"
+            mkdir -p "$out_dir"
+            if [[ "$url" == *"gofile.io/d/"* ]]; then
+              (cd "$CM_BUILD_DIR/gf_dl" && GF_DOWNLOAD_DIR="$out_dir" uv run gofile-downloader.py "$url")
+            elif [[ "$url" == *"drive.google.com"* ]]; then
+              gdown "$url" -O "$out_dir/"
+            else
+              local fname
+              fname=$(basename "${url%%\?*}")
+              [ -n "$fname" ] || fname="downloaded_file"
+              curl -fL --retry 3 "$url" -o "$out_dir/$fname"
+            fi
+          }
+
+          # Hỗ trợ nhiều link cách nhau bằng dấu phẩy hoặc khoảng trắng
+          download_multi() {
+            local urls="$1"
+            local out_dir="$2"
+            local IFS=$' ,\n\t'
+            for u in $urls; do
+              [ -n "$u" ] && download_one_url "$u" "$out_dir"
+            done
+          }
+
+          # Tự động giải nén .part1.rar / .rar / .zip / .7z (hỗ trợ cả mật khẩu ARCHIVE_PASS nếu có)
+          extract_archives() {
+            local src_dir="$1"
+            local dst_dir="$2"
+            mkdir -p "$dst_dir"
+            # Gom tất cả file lồng bên trong thư mục con Gofile về src_dir
+            find "$src_dir" -mindepth 2 -type f -exec mv -f {} "$src_dir/" \; 2>/dev/null || true
+
+            local PASS_ARGS=()
+            if [ -n "${ARCHIVE_PASS:-}" ]; then
+              PASS_ARGS=(-p "$ARCHIVE_PASS")
+            fi
+
+            # 1) Multi-part RAR (.part1.rar / .part01.rar)
+            local PART1
+            PART1=$(find "$src_dir" -maxdepth 1 -type f \( -iname "*.part1.rar" -o -iname "*.part01.rar" -o -iname "*.part001.rar" \) | head -n 1 || true)
+            if [ -n "$PART1" ]; then
+              echo "Extracting multi-part RAR: $(basename "$PART1")"
+              unar -force-overwrite ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} -output-directory "$dst_dir" "$PART1"
+              return 0
+            fi
+
+            # 2) Single RAR
+            local RARF
+            RARF=$(find "$src_dir" -maxdepth 1 -type f -iname "*.rar" | head -n 1 || true)
+            if [ -n "$RARF" ]; then
+              echo "Extracting RAR: $(basename "$RARF")"
+              unar -force-overwrite ${PASS_ARGS[@]+"${PASS_ARGS[@]}"} -output-directory "$dst_dir" "$RARF"
+              return 0
+            fi
+
+            # 3) ZIP / 7Z / .001
+            local ARCH
+            ARCH=$(find "$src_dir" -maxdepth 1 -type f \( -iname "*.zip" -o -iname "*.7z" -o -iname "*.001" \) | head -n 1 || true)
+            if [ -n "$ARCH" ]; then
+              echo "Extracting archive: $(basename "$ARCH")"
+              if [ -n "${ARCHIVE_PASS:-}" ]; then
+                7zz x -y "-p${ARCHIVE_PASS}" "-o${dst_dir}" "$ARCH"
+              else
+                7zz x -y "-o${dst_dir}" "$ARCH"
+              fi
+              return 0
+            fi
+
+            # 4) Không phải file nén -> copy thẳng
+            cp -R "$src_dir/"* "$dst_dir/" 2>/dev/null || true
+          }
+
+          if [ -z "${BASE_URL:-}" ] || [ -z "${UPDATE_URL:-}" ] || [ -z "${KEYS_URL:-}" ]; then
+            echo "ERROR: BASE_URL, UPDATE_URL (1.8d.310c / v393216), and KEYS_URL must be set in fc27_secrets."
+            exit 1
+          fi
+
+          # Tải song song Base + Update + Keys + VH + Squad để rút ngắn thời gian build
+          (echo "Downloading Base..." && download_multi "$BASE_URL" "$GAME_DIR/base_dl") &
+          P1=$!
+          (echo "Downloading Update 1.8d.310c..." && download_multi "$UPDATE_URL" "$GAME_DIR/upd_dl") &
+          P2=$!
+          (echo "Downloading prod.keys..." && download_multi "$KEYS_URL" "$KEYS_DIR") &
+          P3=$!
+
+          P4=""
+          if [ -n "${VH_URL:-}" ]; then
+            (echo "Downloading Vietnamese patch (VH_URL)..." && download_multi "$VH_URL" "$VH_DL_DIR") &
+            P4=$!
+          fi
+
+          P5=""
+          if [ -n "${SQUAD_SAVE_URL:-}" ]; then
+            (echo "Downloading Squad Save (SQUAD_SAVE_URL)..." && download_multi "$SQUAD_SAVE_URL" "$SQUAD_DL_DIR") &
+            P5=$!
+          fi
+
+          wait "$P1" "$P2" "$P3"
+          [ -n "$P4" ] && wait "$P4"
+          [ -n "$P5" ] && wait "$P5"
+
+          if [ -n "${DLC_URL:-}" ]; then
+            echo "Downloading optional DLC..."
+            download_multi "$DLC_URL" "$GAME_DIR/dlc_dl"
+          fi
+          if [ -n "${BG_IMAGE_URL:-}" ]; then
+            echo "Downloading custom launcher background..."
+            download_multi "$BG_IMAGE_URL" "$BG_DIR"
+          fi
+
+          # Giải nén Base / Update nếu cậu up dạng .part*.rar / .zip / .7z
+          for sub in base_dl upd_dl dlc_dl; do
+            if [ -d "$GAME_DIR/$sub" ]; then
+              if find "$GAME_DIR/$sub" -type f \( -iname "*.rar" -o -iname "*.zip" -o -iname "*.7z" -o -iname "*.001" \) | grep -q .; then
+                extract_archives "$GAME_DIR/$sub" "$GAME_DIR/${sub}_ext"
+                rm -rf "$GAME_DIR/$sub"
+              fi
+            fi
+          done
+
+          # Gom toàn bộ file .nsp / .nsz / .xci về GAME_DIR
+          find "$GAME_DIR" -mindepth 2 -type f \( -iname "*.nsp" -o -iname "*.nsz" -o -iname "*.xci" \) -exec mv -f {} "$GAME_DIR/" \;
+
+          # Giải nén VH và Squad (nếu có)
+          if [ -n "${VH_URL:-}" ]; then
+            extract_archives "$VH_DL_DIR" "$VH_DIR"
+            rm -rf "$VH_DL_DIR"
+            echo "VH extracted contents:"
+            find "$VH_DIR" -maxdepth 3
+          fi
+
+          if [ -n "${SQUAD_SAVE_URL:-}" ]; then
+            extract_archives "$SQUAD_DL_DIR" "$SQUAD_DIR"
+            rm -rf "$SQUAD_DL_DIR"
+            echo "Squad save extracted contents:"
+            find "$SQUAD_DIR" -maxdepth 3
+          fi
+
+          KEY_FILE=$(find "$KEYS_DIR" -type f ! -name ".*" | head -n 1)
+          if [ -z "$KEY_FILE" ]; then
+            echo "ERROR: prod.keys not found after download!"
+            exit 1
+          fi
+          [ "$KEY_FILE" = "$KEYS_DIR/prod.keys" ] || cp -f "$KEY_FILE" "$KEYS_DIR/prod.keys"
+
+          ls -lh "$GAME_DIR"
+          df -h /
+
+      - name: 4. Apply Miao Glass UI, Color Filter, VH Hook & Build FC 27 IPA + romfs.img
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export DOTNET_ROOT_ARM64="$HOME/.dotnet"
+          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
+          export DOTNET_ROLL_FORWARD=Major
+          export PATH="$HOME/.dotnet:$PATH"
+
+          ENGINE_DIR="$CM_BUILD_DIR/nx2apple/engine"
+          GAME_DIR="$CM_BUILD_DIR/game_nsp"
+          KEYS_FILE="$CM_BUILD_DIR/keys/prod.keys"
+          VH_DIR="$CM_BUILD_DIR/vh_extracted"
+          SQUAD_DIR="$CM_BUILD_DIR/squad_extracted"
+          BG_DIR="$CM_BUILD_DIR/bg_dl"
+          OUT_DIR="$CM_BUILD_DIR/final_out"
+          LOG_DIR="$GAME_DIR/0100C49025D3E000_build/logs"
+          mkdir -p "$OUT_DIR"
+
+          trap 'echo "=== ERROR LOGS ==="; for lf in "$LOG_DIR"/*.log; do [ -f "$lf" ] && echo "--- $lf ---" && tail -n 120 "$lf"; done' ERR
+
+          # 4A. Chạy 3 script tùy biến của repo flsgming/fc27
+          python3 "$CM_BUILD_DIR/scripts/miao_launcher.py" --engine-dir "$ENGINE_DIR"
+          python3 "$CM_BUILD_DIR/scripts/miao_color.py" --engine-dir "$ENGINE_DIR"
+
+          if [ -n "${VH_URL:-}" ]; then
+            python3 "$CM_BUILD_DIR/scripts/miao_apply_vh.py" \
+              --hook-builder "$ENGINE_DIR/scripts/build_ipa_from_nsp.py" \
+              --vh-dir "$VH_DIR" \
+              --engine-dir "$ENGINE_DIR"
+          fi
+
+          # 4B. Full RAM entitlements (cả 15 Pro+ lẫn 14 Pro / 13 Pro 6 GB RAM)
+          cat << 'EOF' > "$CM_BUILD_DIR/ios_entitlements.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key>
+            <true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          LANG_ARGS=()
+          if [ "${GAME_LANG:-en}" != "en" ]; then
+            LANG_ARGS=(-l "$GAME_LANG")
+          fi
+
+          cd "$ENGINE_DIR"
+          DM_ENTITLEMENTS="$CM_BUILD_DIR/ios_entitlements.plist" \
+            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" --platform ios --romfs separate --allow-other-metal -k "$KEYS_FILE" ${LANG_ARGS[@]+"${LANG_ARGS[@]}"}
+
+          # 4C. Di chuyển RomFS.img (đã ghép VH nếu có) và IPA ra OUT_DIR trước khi dọn ổ
+          ROMFS_PATH=$(find "$GAME_DIR/0100C49025D3E000_build/extract" -maxdepth 2 -name "RomFS.img" ! -path "*.partial/*" | head -n 1 || true)
+          if [ -z "$ROMFS_PATH" ] || [ ! -f "$ROMFS_PATH" ]; then
+            echo "ERROR: RomFS.img not found after build!"
+            exit 1
+          fi
+          mv -f "$ROMFS_PATH" "$OUT_DIR/romfs.img"
+
+          IPA_PATH=$(find "$GAME_DIR" -maxdepth 2 -name "*.ipa" | head -n 1 || true)
+          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
+            echo "ERROR: EaSportsFc27.ipa not found after build!"
+            exit 1
+          fi
+          mv -f "$IPA_PATH" "$OUT_DIR/EaSportsFc27.ipa"
+
+          rm -rf "$GAME_DIR" "$VH_DIR"
+
+          # 4D. Đóng gói thêm ảnh nền Launcher + Squad chuyển nhượng + bản quyền vào bên trong .ipa
+          WORK_IPA="$CM_BUILD_DIR/ipa_pack"
+          mkdir -p "$WORK_IPA"
+          unzip -qo "$OUT_DIR/EaSportsFc27.ipa" -d "$WORK_IPA"
+          APP_DIR=$(find "$WORK_IPA/Payload" -maxdepth 1 -name "*.app" -type d | head -n 1)
+
+          if [ -n "$APP_DIR" ]; then
+            # Bản quyền Info.plist
+            PLIST="$APP_DIR/Info.plist"
+            if [ -f "$PLIST" ]; then
+              /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright 'Port by miaomiaocutene'" "$PLIST" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string 'Port by miaomiaocutene'" "$PLIST"
+            fi
+
+            # Nhúng ảnh nền Launcher (ưu tiên BG_IMAGE_URL, rồi tới assets/launcher_bg.jpg|.png trong repo)
+            BG_FILE=$(find "$BG_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | head -n 1 || true)
+            if [ -z "$BG_FILE" ]; then
+              for cand in "$CM_BUILD_DIR/assets/launcher_bg.jpg" "$CM_BUILD_DIR/assets/launcher_bg.png" "$CM_BUILD_DIR/assets/miao_bg.jpg" "$CM_BUILD_DIR/assets/miao_bg.png"; do
+                if [ -f "$cand" ]; then
+                  BG_FILE="$cand"
+                  break
+                fi
+              done
+            fi
+            if [ -n "$BG_FILE" ]; then
+              EXT="${BG_FILE##*.}"
+              EXT_LOW=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+              [ "$EXT_LOW" = "jpeg" ] && EXT_LOW="jpg"
+              cp -f "$BG_FILE" "$APP_DIR/miao_bg.${EXT_LOW}"
+              echo "Embedded launcher background: miao_bg.${EXT_LOW}"
+            fi
+
+            # Nhúng Squad chuyển nhượng vào miao_default_save/
+            if [ -n "${SQUAD_SAVE_URL:-}" ] && [ -d "$SQUAD_DIR" ]; then
+              SAVE_SRC=$(find "$SQUAD_DIR" -maxdepth 2 -type d -iname "save" | head -n 1 || true)
+              mkdir -p "$APP_DIR/miao_default_save"
+              if [ -n "$SAVE_SRC" ]; then
+                cp -R "$SAVE_SRC/"* "$APP_DIR/miao_default_save/"
+              else
+                cp -R "$SQUAD_DIR/"* "$APP_DIR/miao_default_save/"
+              fi
+              echo "Embedded Squad transfer save into miao_default_save/:"
+              ls -la "$APP_DIR/miao_default_save"
+            fi
+          fi
+
+          rm -f "$OUT_DIR/EaSportsFc27.ipa"
+          (cd "$WORK_IPA" && zip -qry "$OUT_DIR/EaSportsFc27.ipa" Payload)
+          rm -rf "$WORK_IPA" "$SQUAD_DIR" "$BG_DIR"
+
+          ls -lh "$OUT_DIR/EaSportsFc27.ipa" "$OUT_DIR/romfs.img"
+          df -h /
+
+      - name: 5. Stream-Upload EaSportsFc27.ipa + romfs.img to Gofile (curl, 0 RAM Bloat)
+        script: |
+          set -euo pipefail
+          source "$CM_BUILD_DIR/.venv/bin/activate"
+
+          OUT_DIR="$CM_BUILD_DIR/final_out"
+          [ -f "$OUT_DIR/EaSportsFc27.ipa" ] && [ -f "$OUT_DIR/romfs.img" ] || { echo "ERROR: Missing IPA or romfs.img in $OUT_DIR"; exit 1; }
+
+          SERVER=$(python3 -c 'import requests; print(requests.get("https://api.gofile.io/servers", timeout=30).json()["data"]["servers"][0]["name"])')
+          UPLOAD_URL="https://${SERVER}.gofile.io/contents/uploadfile"
+          echo "Using Gofile server: $SERVER"
+
+          FOLDER_ID=""
+          GUEST_TOKEN=""
+          DOWNLOAD_PAGE=""
+
+          upload_one() {
+            local fp="$1"
+            local name
+            name=$(basename "$fp")
+            local size_h
+            size_h=$(du -h "$fp" | cut -f1)
+            local attempt
+            for attempt in 1 2 3; do
+              echo "Uploading $name ($size_h) [try $attempt/3]..."
+              local CURL_ARGS=(-f -sS --max-time 5400 -F "file=@${fp}")
+              if [ -n "$FOLDER_ID" ]; then
+                CURL_ARGS+=(-F "folderId=${FOLDER_ID}" -F "token=${GUEST_TOKEN}")
+              fi
+              if RESP=$(curl "${CURL_ARGS[@]}" "$UPLOAD_URL"); then
+                STATUS=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status",""))' "$RESP")
+                if [ "$STATUS" = "ok" ]; then
+                  if [ -z "$FOLDER_ID" ]; then
+                    FOLDER_ID=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"]["parentFolder"])' "$RESP")
+                    GUEST_TOKEN=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"].get("guestToken",""))' "$RESP")
+                    DOWNLOAD_PAGE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["data"]["downloadPage"])' "$RESP")
+                    echo ""
+                    echo "=========================================="
+                    echo "GOFILE DOWNLOAD PAGE: $DOWNLOAD_PAGE"
+                    echo "=========================================="
+                    echo ""
+                  fi
+                  echo "Done: $name"
+                  return 0
+                fi
+              fi
+              echo "WARN: Upload failed for $name (try $attempt), retrying in 10s..."
+              sleep 10
+            done
+            echo "ERROR: Upload failed after 3 tries for $name"
+            exit 1
+          }
+
+          upload_one "$OUT_DIR/EaSportsFc27.ipa"
+          upload_one "$OUT_DIR/romfs.img"
+
+          echo ""
+          echo "ALL DONE! Download BOTH EaSportsFc27.ipa & romfs.img from: $DOWNLOAD_PAGE"
