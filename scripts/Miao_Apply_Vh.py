@@ -103,11 +103,19 @@ def apply_ips32_to_nso(nso_path: Path, ips_path: Path) -> None:
         comp_size = struct.unpack_from("<I", raw, fsize_off)[0]
         blob = raw[file_off : file_off + comp_size]
         if flags & comp_bit:
-            try:
-                import lz4.block
-            except ImportError as exc:
-                raise RuntimeError("Thiếu thư viện Python 'lz4' để giải nén NSO0!") from exc
-            data = bytearray(lz4.block.decompress(blob, uncompressed_size=decomp_size, store_size=False))
+            if flags & 0x80:
+                # Nintendo SDK 22+ (EA SPORTS FC 27): NSO0 nén bằng ZBIC (bit 7 = 0x80)
+                try:
+                    import zbic
+                except ImportError as exc:
+                    raise RuntimeError("Thiếu thư viện Python 'zbic' để giải nén NSO0 SDK 22+!") from exc
+                data = bytearray(zbic.decompress(blob))
+            else:
+                try:
+                    import lz4.block
+                except ImportError as exc:
+                    raise RuntimeError("Thiếu thư viện Python 'lz4' để giải nén NSO0!") from exc
+                data = bytearray(lz4.block.decompress(blob, uncompressed_size=decomp_size))
         else:
             data = bytearray(blob)
         if len(data) != decomp_size:
@@ -152,7 +160,7 @@ def apply_ips32_to_nso(nso_path: Path, ips_path: Path) -> None:
 
     # Dựng lại file NSO0 không nén (tắt 3 bit nén 0x1|0x2|0x4, cập nhật file_off, comp_size và SHA-256)
     new_hdr = bytearray(raw[:0x100])
-    new_flags = flags & ~0x07
+    new_flags = flags & ~0x87  # Tắt cả 3 bit nén (0x07) và bit ZBIC (0x80)
     struct.pack_into("<I", new_hdr, 0x0C, new_flags)
 
     first_orig_off = min(struct.unpack_from("<I", raw, s["hdr_off"])[0] for s in segs)
