@@ -87,7 +87,7 @@ def patch_settings_tsv(engine_dir: Path) -> None:
 def patch_main_m_low_ram(engine_dir: Path) -> None:
     """
     Khi DM_MIAO_LOW_RAM=1, ép các biến tiết kiệm RAM (720p, 30 fps, tắt MetalFX/MTL4, DM_GUEST_FILE=1)
-    trước khi host khởi động.
+    trước khi host khởi động. Chỉ chèn vào BÊN TRONG thân hàm để tuyệt đối không lỗi biên dịch Objective-C.
     """
     main_m = engine_dir / "dm/ios/Sources/main.m"
     if not main_m.is_file():
@@ -96,26 +96,53 @@ def patch_main_m_low_ram(engine_dir: Path) -> None:
     if "MIAO_LOW_RAM_HOOK" in src:
         return
 
-    # Tìm chỗ đọc xong env / trước khi gọi dm_main hoặc boot_thread
-    m = re.search(r"(dm_main\s*\(|boot_thread|nnosInitialize)", src)
-    if not m:
+    hook_body = (
+        "\n    // MIAO_LOW_RAM_HOOK\n"
+        "    if (getenv(\"DM_MIAO_LOW_RAM\") && strcmp(getenv(\"DM_MIAO_LOW_RAM\"), \"1\") == 0) {\n"
+        "        setenv(\"DM_OPMODE\", \"0\", 1);\n"
+        "        setenv(\"DM_FPS_TARGET\", \"30\", 1);\n"
+        "        setenv(\"DM_PRESENT_UPSCALE\", \"off\", 1);\n"
+        "        setenv(\"DM_PSO_MTL4\", \"0\", 1);\n"
+        "        setenv(\"DM_GUEST_FILE\", \"1\", 1);\n"
+        "    }\n"
+    )
+
+    # 1) Ưu tiên chèn ngay sau dấu '{' của định nghĩa hàm boot_thread / dm_main
+    m_def = re.search(
+        r"^[ \t]*(?:static[ \t]+)?(?:void[ \t]*\*|int|void)[ \t]+(?:boot_thread|dm_main|dm_run_game)\s*\([^;{}]*\)\s*\{",
+        src,
+        flags=re.MULTILINE,
+    )
+    if m_def:
+        patched = src[: m_def.end()] + hook_body + src[m_def.end() :]
+        main_m.write_text(patched, encoding="utf-8")
+        print(f"[LAUNCHER] Đã thêm xử lý DM_MIAO_LOW_RAM vào đầu thân hàm trong {main_m}.")
         return
 
-    # Tìm đầu dòng của câu lệnh chứa dm_main(
-    line_start = src.rfind("\n", 0, m.start()) + 1
-    indent = re.match(r"[ \t]*", src[line_start:]).group(0)
-    hook = (
-        f"{indent}// MIAO_LOW_RAM_HOOK\n"
-        f"{indent}if (getenv(\"DM_MIAO_LOW_RAM\") && strcmp(getenv(\"DM_MIAO_LOW_RAM\"), \"1\") == 0) {{\n"
-        f"{indent}    setenv(\"DM_OPMODE\", \"0\", 1);\n"
-        f"{indent}    setenv(\"DM_FPS_TARGET\", \"30\", 1);\n"
-        f"{indent}    setenv(\"DM_PRESENT_UPSCALE\", \"off\", 1);\n"
-        f"{indent}    setenv(\"DM_PSO_MTL4\", \"0\", 1);\n"
-        f"{indent}    setenv(\"DM_GUEST_FILE\", \"1\", 1);\n"
-        f"{indent}}}\n"
+    # 2) Fallback: chỉ chèn trước lời gọi hàm có thụt lề (bên trong thân hàm, bỏ qua khai báo cột 1)
+    m_call = re.search(
+        r"^([ \t]+)(?:[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*)?(?:dm_main|nnosInitialize)\s*\(",
+        src,
+        flags=re.MULTILINE,
     )
-    main_m.write_text(src[:line_start] + hook + src[line_start:], encoding="utf-8")
-    print(f"[LAUNCHER] Đã thêm xử lý DM_MIAO_LOW_RAM vào {main_m}.")
+    if m_call:
+        indent = m_call.group(1)
+        indented_hook = (
+            f"{indent}// MIAO_LOW_RAM_HOOK\n"
+            f"{indent}if (getenv(\"DM_MIAO_LOW_RAM\") && strcmp(getenv(\"DM_MIAO_LOW_RAM\"), \"1\") == 0) {{\n"
+            f"{indent}    setenv(\"DM_OPMODE\", \"0\", 1);\n"
+            f"{indent}    setenv(\"DM_FPS_TARGET\", \"30\", 1);\n"
+            f"{indent}    setenv(\"DM_PRESENT_UPSCALE\", \"off\", 1);\n"
+            f"{indent}    setenv(\"DM_PSO_MTL4\", \"0\", 1);\n"
+            f"{indent}    setenv(\"DM_GUEST_FILE\", \"1\", 1);\n"
+            f"{indent}}}\n"
+        )
+        patched = src[: m_call.start()] + indented_hook + src[m_call.start() :]
+        main_m.write_text(patched, encoding="utf-8")
+        print(f"[LAUNCHER] Đã thêm xử lý DM_MIAO_LOW_RAM trước lời gọi hàm trong {main_m}.")
+        return
+
+    print(f"[LAUNCHER] Không thấy vị trí thân hàm an toàn trong {main_m} — bỏ qua để tránh lỗi xcodebuild.")
 
 
 SWIFT_MIAO_DEFS = r"""
